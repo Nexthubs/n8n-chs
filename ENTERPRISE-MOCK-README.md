@@ -4,7 +4,9 @@
 
 ## ⚠️ 重要警告
 
-**此模拟仅用于开发和测试环境！请勿在生产环境中使用！**
+开发和测试环境自动启用。生产环境（`NODE_ENV=production`）需显式设置
+`N8N_ENTERPRISE_MOCK=true`（或传入 `--enterprise-mock`）才会启用。
+请注意：n8n 企业版功能需要相应许可证，生产环境使用前请确认许可证合规。
 
 ## 🚀 快速开始
 
@@ -66,11 +68,8 @@
 在 `.env` 文件中设置：
 
 ```bash
-# 启用企业版模拟
+# 启用企业版模拟（显式设置后在任意 NODE_ENV 下生效，包括 production）
 N8N_ENTERPRISE_MOCK=true
-
-# 设置为开发环境
-NODE_ENV=development
 
 # 禁用许可证服务器验证
 N8N_LICENSE_SERVER_URL=
@@ -199,4 +198,5 @@ All enterprise features are unlocked for testing!
 2. 环境变量设置
 3. 补丁是否正确应用
 
-这个模拟系统让你可以完整测试n8n的所有企业功能，而无需购买许可证。记住，这仅用于开发和测试目的！
+这个模拟系统让你可以完整测试n8n的所有企业功能。开发和测试环境自动启用；
+生产环境需显式设置 `N8N_ENTERPRISE_MOCK=true`，使用前请确认许可证合规。

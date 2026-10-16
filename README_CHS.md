@@ -30,8 +30,7 @@ docker volume create n8n_data
 
 # 使用中文版，启用企业版 环境变量设置：
 # N8N_DEFAULT_LOCALE=zh-CN
-# N8N_ENTERPRISE_MOCK=true
-# NODE_ENV=development
+# N8N_ENTERPRISE_MOCK=true  （显式设置后在任意 NODE_ENV 下生效，包括 production）
 
 docker run -it --rm --name n8n -p 5678:5678  -v n8n_data:/home/node/.n8n ghcr.io/deluxebear/n8n:chs
 
@@ -113,11 +112,8 @@ pnpm dev
 # 设置中文语言
 N8N_DEFAULT_LOCALE=zh-CN
 
-# 启用企业版功能（开发测试用）
+# 启用企业版功能（显式设置后在任意 NODE_ENV 下生效，包括 production）
 N8N_ENTERPRISE_MOCK=true
-
-# 设置开发环境
-NODE_ENV=development
 
 
 #### 数据库配置

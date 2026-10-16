@@ -2,7 +2,8 @@
  * 企业版模拟初始化器
  *
  * 此文件在应用启动时自动检查并启用企业版功能模拟
- * 仅在开发和测试环境中生效
+ * 开发和测试环境自动生效；生产环境需显式设置 N8N_ENTERPRISE_MOCK=true
+ * 或传入 --enterprise-mock 参数
  */
 
 import { Container } from '@n8n/di';
@@ -61,8 +62,8 @@ function shouldEnableEnterpriseMock(): boolean {
 		return true;
 	}
 
-	// 检查是否为开发环境
-	if (EnterpriseLicenseMocker.isDevelopmentEnvironment()) {
+	// 检查是否为开发/测试环境，或是否有显式启用信号
+	if (EnterpriseLicenseMocker.isMockAllowed()) {
 		return true;
 	}
 

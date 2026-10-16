@@ -79,19 +79,23 @@ export class EnterpriseLicenseMocker {
 		console.log('[ENTERPRISE MOCK] Original license methods restored');
 	}
 
-	static isDevelopmentEnvironment(): boolean {
+	static isMockAllowed(): boolean {
+		// An explicit opt-in overrides the production guard.
+		if (process.env.N8N_ENTERPRISE_MOCK === 'true' || process.argv.includes('--enterprise-mock')) {
+			return true;
+		}
 		return (
 			process.env.NODE_ENV !== 'production' &&
-			(process.env.NODE_ENV === 'development' ||
-				process.env.NODE_ENV === 'test' ||
-				process.env.N8N_ENTERPRISE_MOCK === 'true')
+			(process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test')
 		);
 	}
 }
 
 export function enableEnterpriseMock(license: License): void {
-	if (!EnterpriseLicenseMocker.isDevelopmentEnvironment()) {
-		console.warn('[ENTERPRISE MOCK] Not in development environment, enterprise mock not enabled');
+	if (!EnterpriseLicenseMocker.isMockAllowed()) {
+		console.warn(
+			'[ENTERPRISE MOCK] Not enabled: set N8N_ENTERPRISE_MOCK=true (or pass --enterprise-mock) to enable it in this environment',
+		);
 		return;
 	}
 

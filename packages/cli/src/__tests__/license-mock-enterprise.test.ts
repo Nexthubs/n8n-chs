@@ -98,9 +98,15 @@ describe('EnterpriseLicenseMocker', () => {
 		}
 	});
 
-	it('does not enable mocks in production', () => {
+	it('enables the mock in production when the flag is set', () => {
 		vi.stubEnv('NODE_ENV', 'production');
 		vi.stubEnv('N8N_ENTERPRISE_MOCK', 'true');
+		enableEnterpriseMock(license);
+		expect(license.getConsumerId()).toBe('enterprise-mock-consumer');
+	});
+
+	it('does not enable the mock in production without the flag', () => {
+		vi.stubEnv('NODE_ENV', 'production');
 		const original = license.isLicensed;
 		enableEnterpriseMock(license);
 		expect(license.isLicensed).toBe(original);
