@@ -5,6 +5,9 @@ ARG N8N_VERSION=snapshot
 ARG BUILDER_IMAGE=node:26.7.0-alpine3.24@sha256:aadf416b2cdce311a8811ba3f0608a61b77dbf997500e2eafe781b51f6a0b019
 ARG RUNTIME_IMAGE=n8nio/base:26.7.0@sha256:33687300c4e94dc00f42ec79ae15082ae07330ecd82ae1167125905b65908ff8
 
+# Statically linked, so it runs on the runtime base regardless of its libc.
+ARG FFMPEG_IMAGE=mwader/static-ffmpeg:8.1.2
+
 # The runtime base has no compiler, so this stage supplies one.
 FROM ${BUILDER_IMAGE} AS toolchain
 RUN apk add --no-cache python3 make g++
@@ -44,6 +47,9 @@ COPY ./compiled/node_modules/.pnpm/@confluentinc+kafka-javascript@*/node_modules
 WORKDIR /build/node_modules/@confluentinc/kafka-javascript
 RUN BUILD_LIBRDKAFKA=0 node "$NODE_GYP" rebuild --release
 
+# Bundles ffmpeg/ffprobe for the Code and Execute Command nodes.
+FROM ${FFMPEG_IMAGE} AS ffmpeg_source
+
 # A separate workflow builds the base image. A new base reaches this image only
 # when you change RUNTIME_IMAGE above.
 FROM ${RUNTIME_IMAGE}
@@ -82,6 +88,10 @@ RUN set -e; \
     mkdir -p /home/node/.n8n; \
     chown -R node:node /home/node; \
     rm -rf /root/.npm /tmp/*
+
+# The static build keeps its execute bits, so the node user can run both tools.
+COPY --from=ffmpeg_source /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg_source /ffprobe /usr/local/bin/ffprobe
 
 EXPOSE 5678/tcp
 USER node
