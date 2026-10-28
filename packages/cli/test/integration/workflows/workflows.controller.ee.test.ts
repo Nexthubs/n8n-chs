@@ -5,6 +5,7 @@ import {
 	createWorkflow,
 	createActiveWorkflow,
 	createWorkflowWithHistory,
+	createWorkflowHistory,
 	getWorkflowSharing,
 	shareWorkflowWithProjects,
 	shareWorkflowWithUsers,
@@ -25,6 +26,7 @@ import {
 	SharedWorkflowRepository,
 	WorkflowRepository,
 	WorkflowPublishedVersionRepository,
+	CredentialsRepository,
 	GLOBAL_MEMBER_ROLE,
 } from '@n8n/db';
 import { Container } from '@n8n/di';
@@ -963,6 +965,73 @@ describe('GET /workflows/:workflowId', () => {
 				},
 			]);
 		});
+
+		describe('the Owner in a team-project workflow', () => {
+			const ownerSees = async (
+				credentialId: string,
+				teamProject: Project,
+				sharedWith: Project[] = [],
+			) => {
+				const workflow = await createWorkflow(
+					makeWorkflow({
+						withPinData: false,
+						withCredential: { id: credentialId, name: 'Credential' },
+					}),
+					teamProject,
+				);
+				if (sharedWith.length > 0) {
+					await shareWorkflowWithProjects(
+						workflow,
+						sharedWith.map((project) => ({ project })),
+					);
+				}
+				const response = await authOwnerAgent.get(`/workflows/${workflow.id}`).expect(200);
+				const responseWorkflow: WorkflowWithSharingsMetaDataAndCredentials = response.body.data;
+				return responseWorkflow.usedCredentials?.[0]?.currentUserCanUse;
+			};
+
+			test('cannot use a personal credential that nobody shared with the project', async () => {
+				const teamProject = await createTeamProject('Marketing', member);
+				const credential = await saveCredential(randomCredentialPayload(), { user: member });
+
+				expect(await ownerSees(credential.id, teamProject)).toBe(false);
+			});
+
+			test('can use a credential shared with another team project the workflow is in', async () => {
+				const teamProject = await createTeamProject('Marketing', member);
+				const salesProject = await createTeamProject('Sales', member);
+				const credential = await saveCredential(randomCredentialPayload(), { user: member });
+				await shareCredentialWithProjects(credential, [salesProject]);
+
+				expect(await ownerSees(credential.id, teamProject, [salesProject])).toBe(true);
+			});
+
+			test('cannot use the personal credential of someone the workflow is shared with', async () => {
+				const teamProject = await createTeamProject('Marketing', member);
+				const credential = await saveCredential(randomCredentialPayload(), { user: member });
+				const memberPersonalProject = await getPersonalProject(member);
+
+				expect(await ownerSees(credential.id, teamProject, [memberPersonalProject])).toBe(false);
+			});
+
+			test('can use a credential shared with the project', async () => {
+				const teamProject = await createTeamProject('Marketing', member);
+				const credential = await saveCredential(randomCredentialPayload(), { user: member });
+				await shareCredentialWithProjects(credential, [teamProject]);
+
+				expect(await ownerSees(credential.id, teamProject)).toBe(true);
+			});
+
+			test('can use a credential shared with everyone', async () => {
+				const teamProject = await createTeamProject('Marketing', member);
+				const credential = await saveCredential(
+					{ ...randomCredentialPayload(), isGlobal: true },
+					{ user: member },
+				);
+
+				expect(await ownerSees(credential.id, teamProject)).toBe(true);
+			});
+		});
 	});
 });
 
@@ -1417,6 +1486,202 @@ describe('PATCH /workflows/:workflowId', () => {
 				expect(response.body.data.nodes[0].parameters.workflowUrl).toBe(
 					'https://example.com/other.json',
 				);
+			});
+		});
+
+		const nodeWith = (credential: { id: string; name: string }, url = 'https://v1.test') => ({
+			id: 'uuid-restore-1',
+			name: 'Call',
+			parameters: { url },
+			position: [0, 0] as [number, number],
+			type: 'n8n-nodes-base.httpRequest',
+			typeVersion: 4.2,
+			credentials: { httpHeaderAuth: { id: credential.id, name: credential.name } },
+		});
+
+		// The type must match the node's credential key, so the server resolves it by id.
+		const saveHttpHeaderCredential = async (user: User) =>
+			await saveCredential({ ...randomCredentialPayload(), type: 'httpHeaderAuth' }, { user });
+
+		/**
+		 * A member's workflow whose earlier version used the owner's credential. The
+		 * current version no longer has that node, and the member cannot use it.
+		 */
+		const setUp = async () => {
+			const credential = await saveHttpHeaderCredential(owner);
+			const workflow = await createWorkflow({}, member);
+			const oldVersionId = uuid();
+			await createWorkflowHistory(workflow, member, undefined, {
+				versionId: oldVersionId,
+				nodes: [nodeWith(credential)],
+			});
+			return { credential, workflow, oldVersionId };
+		};
+
+		describe('restoring a history version', () => {
+			test('restores a version with a credential the user cannot use', async () => {
+				const { credential, workflow, oldVersionId } = await setUp();
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(credential)],
+					restoredFromVersionId: oldVersionId,
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.body.data.nodes).toEqual([nodeWith(credential)]);
+			});
+
+			test('restores a version after its credential was renamed', async () => {
+				const { credential, workflow, oldVersionId } = await setUp();
+				await Container.get(CredentialsRepository).update(credential.id, { name: 'Renamed' });
+
+				// The editor sends the nodes as the version stored them, with the old name.
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(credential)],
+					restoredFromVersionId: oldVersionId,
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.body.data.nodes[0].credentials.httpHeaderAuth).toEqual({
+					id: credential.id,
+					name: 'Renamed',
+				});
+			});
+
+			test('blocks a credential that no version stored on the node in an ordinary save', async () => {
+				const { workflow } = await setUp();
+				const otherCredential = await saveHttpHeaderCredential(owner);
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(otherCredential)],
+				});
+
+				expect(response.statusCode).toBe(400);
+				expect(response.body.message).toBe(
+					"You don't have access to the credentials in the 'Call' node. Ask the owner to share them with you.",
+				);
+			});
+
+			test('blocks a node that differs from the restored version', async () => {
+				const { credential, workflow, oldVersionId } = await setUp();
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(credential, 'https://changed.test')],
+					restoredFromVersionId: oldVersionId,
+				});
+
+				expect(response.statusCode).toBe(400);
+			});
+
+			test("refuses a version that is not in this workflow's history", async () => {
+				const { credential, workflow } = await setUp();
+				const otherWorkflow = await createWorkflow({}, member);
+				const otherVersionId = uuid();
+				await createWorkflowHistory(otherWorkflow, member, undefined, {
+					versionId: otherVersionId,
+					nodes: [nodeWith(credential)],
+				});
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(credential)],
+					restoredFromVersionId: otherVersionId,
+				});
+
+				expect(response.statusCode).toBe(400);
+				expect(response.body.message).toBe(
+					"The version to restore is not in this workflow's history.",
+				);
+			});
+		});
+
+		describe('switching a node back to a credential a history version stored', () => {
+			/**
+			 * The member switched the node from the owner's credential to their own and
+			 * autosave stored it: the current version has the member's credential, an
+			 * earlier version the owner's.
+			 */
+			const setUpSwitched = async () => {
+				const { credential, workflow } = await setUp();
+				const ownCredential = await saveHttpHeaderCredential(member);
+				await Container.get(WorkflowRepository).update(workflow.id, {
+					nodes: [nodeWith(ownCredential)],
+				});
+				return { credential, ownCredential, workflow };
+			};
+
+			test('saves the node switched back, renamed and moved', async () => {
+				const { credential, workflow } = await setUpSwitched();
+				const switchedBack = { ...nodeWith(credential), name: 'Renamed', position: [10, 20] };
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [switchedBack],
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.body.data.nodes).toEqual([switchedBack]);
+			});
+
+			test('saves the node switched back after its credential was renamed', async () => {
+				const { credential, workflow } = await setUpSwitched();
+				await Container.get(CredentialsRepository).update(credential.id, { name: 'Renamed' });
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith({ id: credential.id, name: 'Renamed' })],
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.body.data.nodes[0].credentials.httpHeaderAuth).toEqual({
+					id: credential.id,
+					name: 'Renamed',
+				});
+			});
+
+			test('saves the node switched back and disabled after its credential was renamed', async () => {
+				const { credential, workflow } = await setUpSwitched();
+				await Container.get(CredentialsRepository).update(credential.id, { name: 'Renamed' });
+
+				// A disabled node is not normalized, so the old credential name reaches the guard.
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [{ ...nodeWith(credential), disabled: true }],
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.body.data.nodes[0].disabled).toBe(true);
+				expect(response.body.data.nodes[0].credentials.httpHeaderAuth.id).toBe(credential.id);
+			});
+
+			test('blocks the switch back when another parameter changed too', async () => {
+				const { credential, workflow } = await setUpSwitched();
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(credential, 'https://changed.test')],
+				});
+
+				expect(response.statusCode).toBe(400);
+				expect(response.body.message).toBe(
+					"You don't have access to the credentials in the 'Call' node. Ask the owner to share them with you.",
+				);
+			});
+
+			test('blocks a credential the user cannot use that no version stored on the node', async () => {
+				const { workflow } = await setUpSwitched();
+				const otherCredential = await saveHttpHeaderCredential(owner);
+
+				const response = await authMemberAgent.patch(`/workflows/${workflow.id}`).send({
+					versionId: workflow.versionId,
+					nodes: [nodeWith(otherCredential)],
+				});
+
+				expect(response.statusCode).toBe(400);
 			});
 		});
 

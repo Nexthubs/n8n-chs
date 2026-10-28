@@ -122,11 +122,6 @@ const baseAgent = {
 } as unknown as AgentResource;
 
 const globalStubs = {
-	ProjectIcon: {
-		name: 'ProjectIcon',
-		template: '<span data-testid="stub-project-icon" />',
-		props: ['icon', 'size', 'borderLess'],
-	},
 	AgentPublishButton: {
 		name: 'AgentPublishButton',
 		template: '<div data-testid="stub-publish" />',
@@ -139,7 +134,7 @@ const globalStubs = {
 			'configValidationStatus',
 			'beforePublish',
 		],
-		emits: ['published', 'unpublished', 'reverted'],
+		emits: ['publish-ready', 'published', 'unpublished', 'reverted'],
 	},
 };
 
@@ -241,12 +236,15 @@ describe('AgentBuilderHeader', () => {
 		expect(wrapper.text()).toContain('Darwin');
 	});
 
-	it('shows the project icon before the breadcrumb', () => {
+	it('passes the project icon to the breadcrumb', () => {
 		const projectIcon = { type: 'emoji' as const, value: '🚀' };
 		const wrapper = mountHeader({ projectIcon });
+		const breadcrumbs = wrapper.findComponent({ name: 'N8nBreadcrumbs' });
+		const items = breadcrumbs.props('items') as Array<{
+			icon?: { type: 'icon' | 'emoji'; value: string };
+		}>;
 
-		expect(wrapper.getComponent({ name: 'ProjectIcon' }).props('icon')).toEqual(projectIcon);
-		expect(wrapper.getComponent({ name: 'ProjectIcon' }).props('size')).toBe('mini');
+		expect(items[0].icon).toEqual(projectIcon);
 	});
 
 	it('links the project breadcrumb to the project agents page', () => {
@@ -313,6 +311,16 @@ describe('AgentBuilderHeader', () => {
 		expect(wrapper.emitted('published')).toBeTruthy();
 		expect(wrapper.emitted('unpublished')).toBeTruthy();
 		expect(wrapper.emitted('reverted')).toBeTruthy();
+	});
+
+	it('forwards publish readiness changes', () => {
+		const wrapper = mountHeader();
+		const publish = wrapper.findComponent({ name: 'AgentPublishButton' });
+
+		publish.vm.$emit('publish-ready', false);
+		publish.vm.$emit('publish-ready', true);
+
+		expect(wrapper.emitted('publish-ready')).toEqual([[false], [true]]);
 	});
 
 	it('forwards header-action from the action menu', () => {

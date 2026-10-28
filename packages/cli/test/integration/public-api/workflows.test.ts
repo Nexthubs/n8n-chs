@@ -832,6 +832,34 @@ describe('GET /workflows', () => {
 		]);
 	});
 
+	test('should not return parentFolder unless includeParentFolder is set', async () => {
+		const folder = await createFolder(memberPersonalProject, { name: 'List Folder' });
+		await createWorkflowWithHistory({}, member);
+		await createWorkflowWithHistory({ parentFolder: folder }, member);
+
+		const response = await authMemberAgent.get('/workflows');
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.data).toHaveLength(2);
+		for (const item of response.body.data) {
+			expect(item).not.toHaveProperty('parentFolder');
+		}
+	});
+
+	test('should return only the parent folder id when includeParentFolder is true', async () => {
+		const folder = await createFolder(memberPersonalProject, { name: 'List Folder' });
+		const rootWorkflow = await createWorkflowWithHistory({}, member);
+		const folderWorkflow = await createWorkflowWithHistory({ parentFolder: folder }, member);
+
+		const response = await authMemberAgent.get('/workflows?includeParentFolder=true');
+
+		expect(response.statusCode).toBe(200);
+		const rootItem = response.body.data.find((w: { id: string }) => w.id === rootWorkflow.id);
+		const folderItem = response.body.data.find((w: { id: string }) => w.id === folderWorkflow.id);
+		expect(rootItem.parentFolder).toBeNull();
+		expect(folderItem.parentFolder).toEqual({ id: folder.id });
+	});
+
 	test('should return activeVersion when filtering by active=true', async () => {
 		await createWorkflowWithHistory({}, member);
 		const activeWorkflow = await createWorkflowWithTriggerAndHistory({}, member);
@@ -1056,6 +1084,72 @@ describe('GET /workflows/:id', () => {
 			}),
 		]);
 	});
+
+	test('should return every publish event of the active version in order', async () => {
+		const workflow = await createWorkflowWithTriggerAndHistory({}, member);
+
+		await authMemberAgent.post(`/workflows/${workflow.id}/activate`);
+		await authMemberAgent.post(`/workflows/${workflow.id}/deactivate`);
+		await authMemberAgent.post(`/workflows/${workflow.id}/activate`);
+
+		const response = await authMemberAgent.get(`/workflows/${workflow.id}`);
+
+		expect(response.statusCode).toBe(200);
+		const events = (
+			response.body.activeVersion.workflowPublishHistory as Array<{ event: string }>
+		).map(({ event }) => event);
+		expect(events).toEqual(['activated', 'deactivated', 'activated']);
+	});
+
+	test('should return a null parentFolder for a workflow at the project root', async () => {
+		const workflow = await createWorkflowWithHistory({}, member);
+
+		const response = await authMemberAgent.get(`/workflows/${workflow.id}`);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.parentFolder).toBeNull();
+	});
+
+	test('should return the parent folder of a workflow in a folder', async () => {
+		const folder = await createFolder(memberPersonalProject, { name: 'Read Folder' });
+		const workflow = await createWorkflowWithHistory({ parentFolder: folder }, member);
+
+		const response = await authMemberAgent.get(`/workflows/${workflow.id}`);
+
+		expect(response.statusCode).toBe(200);
+		expect(Object.keys(response.body.parentFolder).sort()).toEqual([
+			'createdAt',
+			'id',
+			'name',
+			'parentFolderId',
+			'updatedAt',
+		]);
+		expect(response.body.parentFolder).toEqual({
+			id: folder.id,
+			name: 'Read Folder',
+			parentFolderId: null,
+			createdAt: folder.createdAt.toISOString(),
+			updatedAt: folder.updatedAt.toISOString(),
+		});
+	});
+
+	test('should return the immediate parent folder for a workflow in a subfolder', async () => {
+		const outerFolder = await createFolder(memberPersonalProject, { name: 'Outer Folder' });
+		const innerFolder = await createFolder(memberPersonalProject, {
+			name: 'Inner Folder',
+			parentFolder: outerFolder,
+		});
+		const workflow = await createWorkflowWithHistory({ parentFolder: innerFolder }, member);
+
+		const response = await authMemberAgent.get(`/workflows/${workflow.id}`);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.body.parentFolder).toMatchObject({
+			id: innerFolder.id,
+			name: 'Inner Folder',
+			parentFolderId: outerFolder.id,
+		});
+	});
 });
 
 describe('GET /workflows/:id/:versionId', () => {
@@ -1073,6 +1167,7 @@ describe('GET /workflows/:id/:versionId', () => {
 		const response = await authOwnerAgent.get('/workflows/non-existing/version-123');
 
 		expect(response.statusCode).toBe(404);
+		expect(response.headers.deprecation).toBe('@1787702400');
 		// The deprecated path keeps one message for both cases. Callers may match on it.
 		expect(response.body.message).toBe('Version not found');
 	});
@@ -1109,6 +1204,9 @@ describe('GET /workflows/:id/:versionId', () => {
 		await createWorkflowHistoryItem(workflow.id, versionData);
 
 		const response = await authOwnerAgent.get(`/workflows/${workflow.id}/${versionId}`);
+
+		expect(response.statusCode).toBe(200);
+		expect(response.headers.deprecation).toBe('@1787702400');
 
 		const body = response.body as Partial<WorkflowHistory>;
 		expect(body).toEqual({

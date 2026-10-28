@@ -34,7 +34,7 @@ describe('getModuleEntryUrl', () => {
 describe('eligibleModules', () => {
 	it('should not include opt-in modules by default', () => {
 		const eligible = Container.get(ModuleRegistry).eligibleModules;
-		expect(eligible).not.toContain('type-availability-policies');
+		expect(eligible).not.toContain('engine-v2');
 	});
 
 	it('should include policy-infrastructure by default', () => {
@@ -57,11 +57,14 @@ describe('eligibleModules', () => {
 		expect(Container.get(ModuleRegistry).eligibleModules).not.toContain('policy-infrastructure');
 	});
 
-	it.each(['instance-ai', 'agents'])('should include %s by default', (moduleName) => {
-		expect(Container.get(ModuleRegistry).eligibleModules).toContain(moduleName);
-	});
+	it.each(['instance-ai', 'agents', 'agent-evals', 'inbox', 'type-availability-policies'])(
+		'should include %s by default',
+		(moduleName) => {
+			expect(Container.get(ModuleRegistry).eligibleModules).toContain(moduleName);
+		},
+	);
 
-	it.each(['instance-ai', 'agents'])(
+	it.each(['instance-ai', 'agents', 'agent-evals', 'inbox', 'type-availability-policies'])(
 		'should allow opting out of the default %s module via env var',
 		(moduleName) => {
 			process.env.N8N_DISABLED_MODULES = moduleName;
@@ -79,6 +82,9 @@ describe('eligibleModules', () => {
 			'data-table',
 			'oauth-server',
 			'mcp',
+			// Experiment cleanup (123_surface_mcp_to_claude_trial_users)
+			'mcp-discovery',
+			// EOF Experiment cleanup
 			'provisioning',
 			'breaking-changes',
 			'source-control',
@@ -102,13 +108,17 @@ describe('eligibleModules', () => {
 			'runtime-credentials',
 			'mcp-registry',
 			'workflow-reviews',
+			'inbox',
 			'instance-ai',
 			'agents',
+			'agent-evals',
+			'scim',
+			'type-availability-policies',
 		]);
 	});
 
 	it('should consider a module eligible if it was enabled via env var', () => {
-		process.env.N8N_ENABLED_MODULES = 'type-availability-policies';
+		process.env.N8N_ENABLED_MODULES = 'engine-v2';
 		expect(Container.get(ModuleRegistry).eligibleModules).toEqual([
 			'policy-infrastructure',
 			'inbound-auth-core',
@@ -118,6 +128,9 @@ describe('eligibleModules', () => {
 			'data-table',
 			'oauth-server',
 			'mcp',
+			// Experiment cleanup (123_surface_mcp_to_claude_trial_users)
+			'mcp-discovery',
+			// EOF Experiment cleanup
 			'provisioning',
 			'breaking-changes',
 			'source-control',
@@ -141,9 +154,13 @@ describe('eligibleModules', () => {
 			'runtime-credentials',
 			'mcp-registry',
 			'workflow-reviews',
+			'inbox',
 			'instance-ai',
 			'agents',
+			'agent-evals',
+			'scim',
 			'type-availability-policies',
+			'engine-v2',
 		]);
 	});
 

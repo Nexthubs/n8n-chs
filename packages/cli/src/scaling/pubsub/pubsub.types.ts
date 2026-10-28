@@ -42,6 +42,7 @@ export namespace PubSub {
 		export type ReloadLicense = ToCommand<'reload-license'>;
 		export type ReloadOIDCConfiguration = ToCommand<'reload-oidc-config'>;
 		export type ReloadSamlConfiguration = ToCommand<'reload-saml-config'>;
+		export type ReloadOAuthSigningKeys = ToCommand<'reload-oauth-signing-keys'>;
 		export type ReloadCredentialsOverwrites = ToCommand<'reload-overwrite-credentials'>;
 		export type RestartEventBus = ToCommand<'restart-event-bus'>;
 		export type ReloadExternalSecretsProviders = ToCommand<'reload-external-secrets-providers'>;
@@ -90,6 +91,7 @@ export namespace PubSub {
 		export type AgentConfigChanged = ToCommand<'agent-config-changed'>;
 		export type AgentTasksChanged = ToCommand<'agent-tasks-changed'>;
 		export type RedactionFloorChanged = ToCommand<'redaction-floor-changed'>;
+		export type ReloadTypeAvailabilityPolicies = ToCommand<'reload-type-availability-policies'>;
 	}
 
 	/** Command sent via the `n8n.commands` pubsub channel. */
@@ -128,6 +130,7 @@ export namespace PubSub {
 		| Commands.ClearTestWebhooks
 		| Commands.ReloadOIDCConfiguration
 		| Commands.ReloadSamlConfiguration
+		| Commands.ReloadOAuthSigningKeys
 		| Commands.ReloadCredentialsOverwrites
 		| Commands.ReloadSsoProvisioningConfiguration
 		| Commands.ReloadSourceControlConfiguration
@@ -143,7 +146,8 @@ export namespace PubSub {
 		| Commands.AgentChatLeaderChannelResult
 		| Commands.AgentConfigChanged
 		| Commands.AgentTasksChanged
-		| Commands.RedactionFloorChanged;
+		| Commands.RedactionFloorChanged
+		| Commands.ReloadTypeAvailabilityPolicies;
 
 	// ----------------------------------
 	//         worker responses

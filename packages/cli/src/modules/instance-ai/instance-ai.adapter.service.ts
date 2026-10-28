@@ -171,6 +171,7 @@ import {
 	scopeCredentialProvider,
 	type AgentCredentialProvider,
 } from './eval/scoped-credential-provider';
+import type { EvalCredentialTestTarget } from './eval/thread-credential-allowlist.service';
 import { InstanceAiBuilderDelegateAdapterService } from '@/modules/agents/instance-ai-builder-delegate.adapter';
 import { DataTableRepository } from '@/modules/data-table/data-table.repository';
 import { DataTableService } from '@/modules/data-table/data-table.service';
@@ -182,7 +183,11 @@ import { resolveMcpRegistryConnection } from '@/modules/mcp-registry/mcp-registr
 import type { McpRegistrySearchResult } from '@/modules/mcp-registry/registry/mcp-registry-search';
 import { McpRegistryService } from '@/modules/mcp-registry/registry/mcp-registry.service';
 import { WorkflowDependencyQueryService } from '@/modules/workflow-index/workflow-dependency-query.service';
-import { NodeCatalogService } from '@/node-catalog';
+import {
+	getModuleDisabledNodeTypes,
+	getModuleDisabledNotice,
+	NodeCatalogService,
+} from '@/node-catalog';
 import { ExecuteNodeService } from '@/node-execution';
 import type { ExecuteNodeResult } from '@/node-execution';
 import { NodeTypes } from '@/node-types';
@@ -200,12 +205,17 @@ import { TagService } from '@/services/tag.service';
 import { Telemetry } from '@/telemetry';
 import { resolveBuiltinNodeDefinitionDirs } from '@/utils/node-definition-dirs';
 import { WorkflowRunner } from '@/workflow-runner';
+import {
+	assertExecutionTimeoutWithinMax,
+	exceedsMaxExecutionTimeout,
+} from '@/workflows/execution-timeout-validation';
 import { getRequiredRedactionScopes } from '@/workflows/utils';
 import { WorkflowFinderService } from '@/workflows/workflow-finder.service';
 import { WorkflowHistoryService } from '@/workflows/workflow-history/workflow-history.service';
 import { WorkflowService } from '@/workflows/workflow.service';
 import { EnterpriseWorkflowService } from '@/workflows/workflow.service.ee';
 
+import { isAgentsAccessEnabled } from './agents-access';
 import { extractResolvedNodeParameters } from './extract-resolved-node-parameters';
 import { waitForInstanceAiExecution } from './instance-ai-execution-wait';
 import {
@@ -365,6 +375,33 @@ function toTelemetryReason(
 // process-global and safe to memoize across users.
 let httpCredentialHostsCache: CredentialHostInfo[] | undefined;
 
+/** Instance AI feature flags, resolved for one user. */
+export interface InstanceAiFeatureFlags {
+	/** Config-based evals: never create evals the user can't run. */
+	configEvalsEnabled: boolean;
+	/** Past-conversation recall: tool, prompt section and first-turn hint. */
+	conversationHistoryEnabled: boolean;
+	/** Progressive workflow policy and planning-tool selection. */
+	progressiveBuildingEnabled: boolean;
+	/** Concise reply style. Applies only when the default build mode is selected. */
+	conciseStyleEnabled: boolean;
+	setupPanelEnabled: boolean;
+	setupPanelVariant?: 'control' | 'variant';
+	/** Node-usage context surface: the `node-usage` action and the `nodeTypes` filter on `list`. */
+	nodeUsageEnabled: boolean;
+	/** Node attachments from either the canvas or Assistant mentions rollout. */
+	nodeContextEnabled: boolean;
+	/** Per-user folder-exploration gate, passed into `createContext`. Fails
+	 *  closed with every other gate: `getFeatureFlags` never throws, it
+	 *  returns `{}` on a PostHog outage. */
+	folderExplorationEnabled: boolean;
+	/** Saved AI preferences on every user turn. */
+	aiPreferencesEnabled: boolean;
+	credentialDescriptionsEnabled: boolean;
+	/** Shared activity recording and retrieval use the same instance gate. */
+	instanceContextEnabled: boolean;
+}
+
 @Service()
 export class InstanceAiAdapterService {
 	private readonly logger: Logger;
@@ -477,13 +514,15 @@ export class InstanceAiAdapterService {
 			 *  read on every `list()`: the harness appends credentials it creates
 			 *  mid-run, after this context is built. */
 			getCredentialIdAllowlist?: () => string[] | undefined;
-			resumeAgentBuild?: boolean;
 			/** Eval-only: resolve a credential's connection test as successful without
 			 *  contacting the provider. A predicate rather than a list because the
 			 *  harness registers bypasses mid-run, after this context is built. */
 			shouldBypassCredentialTest?: (credentialId: string) => boolean;
+			/** Eval-only: the provider stand-in for a credential type's connection test.
+			 *  A getter for the same reason as the bypass predicate. */
+			getCredentialTestTarget?: (credentialType: string) => EvalCredentialTestTarget | undefined;
 			/** Pre-bound agent for the build-existing-agent flow. When omitted, the
-			 *  assistant can create one via the build-agent tool. */
+			 *  assistant can create one via the agent_builder_build_agent tool. */
 			agentId?: string;
 			/** Per-user config-evals gate (via `resolveExperimentGates`). Falsy →
 			 *  eval-config service/tool not wired. */
@@ -522,8 +561,8 @@ export class InstanceAiAdapterService {
 			threadId,
 			projectId,
 			getCredentialIdAllowlist,
-			resumeAgentBuild = false,
 			shouldBypassCredentialTest,
+			getCredentialTestTarget,
 			agentId,
 			configEvalsEnabled,
 			setupPanelVariant,
@@ -543,12 +582,13 @@ export class InstanceAiAdapterService {
 		// underlying config is cached process-wide (1h TTL) so this rarely hits
 		// the network, and telemetry must never block context creation.
 		void this.trackGatewayAvailability();
-		const builderDelegateAdapter = this.getBuilderDelegateAdapter(resumeAgentBuild);
+		const builderDelegateAdapter = this.getBuilderDelegateAdapter();
 		const credentialService = this.createCredentialAdapter(
 			user,
 			projectId,
 			getCredentialIdAllowlist,
 			shouldBypassCredentialTest,
+			getCredentialTestTarget,
 		);
 		return {
 			userId: user.id,
@@ -657,18 +697,11 @@ export class InstanceAiAdapterService {
 	 * active. The adapter class is statically imported (so its `@Service` is
 	 * always registered), so the module-enabled check is what gates
 	 * agent-building. Returns null when the module is off, so `builderDelegate`
-	 * (and the build-agent sub-agent tool it powers) is simply absent from the
+	 * (and the agent builder tools it supplies) is simply absent from the
 	 * context.
 	 */
-	private getBuilderDelegateAdapter(
-		resumeAgentBuild: boolean,
-	): InstanceAiBuilderDelegateAdapterService | null {
-		const moduleRegistry = Container.get(ModuleRegistry);
-		if (
-			!moduleRegistry.isActive('agents') ||
-			(!resumeAgentBuild && moduleRegistry.settings.get('agents')?.enabled === false)
-		)
-			return null;
+	private getBuilderDelegateAdapter(): InstanceAiBuilderDelegateAdapterService | null {
+		if (!isAgentsAccessEnabled()) return null;
 		try {
 			return Container.get(InstanceAiBuilderDelegateAdapterService);
 		} catch (error) {
@@ -696,31 +729,7 @@ export class InstanceAiAdapterService {
 	}
 
 	/** Resolves experiment assignments. */
-	async resolveExperimentGates(user: User): Promise<{
-		/** Config-based evals: never create evals the user can't run. */
-		configEvalsEnabled: boolean;
-		/** Past-conversation recall: tool, prompt section and first-turn hint. */
-		conversationHistoryEnabled: boolean;
-		/** Progressive workflow policy and planning-tool selection. */
-		progressiveBuildingEnabled: boolean;
-		/** Concise reply style. Applies only when the default build mode is selected. */
-		conciseStyleEnabled: boolean;
-		setupPanelEnabled: boolean;
-		setupPanelVariant?: 'control' | 'variant';
-		/** Node-usage context surface: the `node-usage` action and the `nodeTypes` filter on `list`. */
-		nodeUsageEnabled: boolean;
-		/** Node attachments from either the canvas or Assistant mentions rollout. */
-		nodeContextEnabled: boolean;
-		/** Per-user folder-exploration gate, passed into `createContext`. Fails
-		 *  closed with every other gate: `getFeatureFlags` never throws, it
-		 *  returns `{}` on a PostHog outage. */
-		folderExplorationEnabled: boolean;
-		/** Saved AI preferences on every user turn. */
-		aiPreferencesEnabled: boolean;
-		credentialDescriptionsEnabled: boolean;
-		/** Shared activity recording and retrieval use the same instance gate. */
-		instanceContextEnabled: boolean;
-	}> {
+	async resolveExperimentGates(user: User): Promise<InstanceAiFeatureFlags> {
 		let flags: Awaited<ReturnType<PostHogClient['getFeatureFlags']>> = {};
 		let instanceContextEnabled = false;
 		try {
@@ -880,7 +889,9 @@ export class InstanceAiAdapterService {
 		return {
 			execute: async (request) => {
 				this.assertInstanceNotReadOnly('executions');
-				const projectId = await resolveProjectId(['workflow:execute']);
+				// The caller supplies the node type and parameters, so a standalone run
+				// authors a workflow. See ADR-20261012-require-create-and-execute-scopes-for-standalone-node-runs.
+				const projectId = await resolveProjectId(['workflow:create', 'workflow:execute']);
 				const result = await executeNodeService.run(user, {
 					type: request.type,
 					version: request.version,
@@ -1061,11 +1072,15 @@ export class InstanceAiAdapterService {
 			executionPersistence,
 			license,
 			telemetry,
+			// Experiment cleanup (123_surface_mcp_to_claude_trial_users)
+			eventService,
+			// EOF Experiment cleanup
 			collaborationService,
 			policyEnforcementService,
 			workflowDependencyQueryService,
 		} = this;
 		const logger = this.logger;
+		const maxExecutionTimeout = this.globalConfig.executions.maxTimeout;
 		const assertNotReadOnly = () => this.assertInstanceNotReadOnly('workflows');
 		// Resolved once per context, upstream in `createContext`: the tool registers the action from
 		// the method's presence, so nothing downstream has to know a rollout flag exists.
@@ -1682,6 +1697,7 @@ export class InstanceAiAdapterService {
 					executionOrder: 'v1',
 					...(json.settings ?? {}),
 				} as IWorkflowSettings;
+				assertExecutionTimeoutWithinMax(settings.executionTimeout, maxExecutionTimeout);
 
 				// Strip redactionPolicy if the user lacks the required scope —
 				// mirrors the check in WorkflowCreationService.createWorkflow().
@@ -1793,6 +1809,12 @@ export class InstanceAiAdapterService {
 				}
 
 				if (threadId) {
+					// Experiment cleanup (123_surface_mcp_to_claude_trial_users)
+					eventService.emit('experiment-assistant-change-saved', {
+						userId: user.id,
+						at: Date.now(),
+					});
+					// EOF Experiment cleanup
 					telemetry.track('Builder created workflow', {
 						...setupExperimentProperties,
 						user_id: user.id,
@@ -1817,12 +1839,26 @@ export class InstanceAiAdapterService {
 				assertNotReadOnly();
 				assertParameterValuesAvailable();
 				await assertNotLockedByEditor(workflowId);
+				const settings = (json.settings ?? {}) as IWorkflowSettings;
+				// Loaded on first use only. The checks below share one query.
+				let storedWorkflow: Promise<WorkflowEntity | null> | undefined;
+				const getStoredWorkflow = async () =>
+					await (storedWorkflow ??= workflowRepository.findOne({ where: { id: workflowId } }));
+
+				// Only a changed value is checked, so a workflow saved before the
+				// maximum was lowered stays saveable.
+				if (exceedsMaxExecutionTimeout(settings.executionTimeout, maxExecutionTimeout)) {
+					const existingWorkflow = await getStoredWorkflow();
+					if (existingWorkflow?.settings?.executionTimeout !== settings.executionTimeout) {
+						assertExecutionTimeoutWithinMax(settings.executionTimeout, maxExecutionTimeout);
+					}
+				}
+
 				// Strip redactionPolicy if the user lacks the required directional scope —
 				// mirrors the check in WorkflowService.update().
-				const settings = (json.settings ?? {}) as IWorkflowSettings;
 				if (settings.redactionPolicy !== undefined) {
 					const [existingWorkflow, ownerProject] = await Promise.all([
-						workflowRepository.findOne({ where: { id: workflowId } }),
+						getStoredWorkflow(),
 						sharedWorkflowRepository.getWorkflowOwningProject(workflowId),
 					]);
 
@@ -1887,6 +1923,12 @@ export class InstanceAiAdapterService {
 				}
 
 				if (threadId) {
+					// Experiment cleanup (123_surface_mcp_to_claude_trial_users)
+					eventService.emit('experiment-assistant-change-saved', {
+						userId: user.id,
+						at: Date.now(),
+					});
+					// EOF Experiment cleanup
 					telemetry.track('Builder modified workflow', {
 						...setupExperimentProperties,
 						user_id: user.id,
@@ -2342,7 +2384,7 @@ export class InstanceAiAdapterService {
 				const target = nodes.find((node) => node.name === nodeName);
 				if (!target) {
 					throw new UserError(
-						`The workflow has no node named "${nodeName}". Use workflows(action="get-as-code") to see the node names.`,
+						`The workflow has no node named "${nodeName}". Use workflow_builder_workflows(action="get-as-code") to see the node names.`,
 					);
 				}
 				if (target.disabled) {
@@ -2422,7 +2464,7 @@ export class InstanceAiAdapterService {
 						throw new UserError(
 							`Node "${nodeName}" holds several tools, and a step run cannot pick one of them. ` +
 								`Run ${roots} instead, then read this node with ` +
-								'executions(action="get-node-output") on that execution: it holds what every ' +
+								'workflow_builder_executions(action="get-node-output") on that execution: it holds what every ' +
 								'tool call returned.',
 						);
 					}
@@ -2437,7 +2479,7 @@ export class InstanceAiAdapterService {
 							`Node "${nodeName}" runs through ${roots}, and ${upper} runs above another of them, ` +
 								`so a step run would run ${upper} and the nodes after it again. ` +
 								`Run ${upper} instead, then read this node with ` +
-								'executions(action="get-node-output") on that execution: it holds what every ' +
+								'workflow_builder_executions(action="get-node-output") on that execution: it holds what every ' +
 								'tool call returned.',
 						);
 					}
@@ -2732,6 +2774,7 @@ export class InstanceAiAdapterService {
 		boundProjectId?: string,
 		getCredentialIdAllowlist?: () => string[] | undefined,
 		shouldBypassCredentialTest?: (credentialId: string) => boolean,
+		getCredentialTestTarget?: (credentialType: string) => EvalCredentialTestTarget | undefined,
 	): InstanceAiCredentialService {
 		const {
 			credentialsService,
@@ -2841,11 +2884,18 @@ export class InstanceAiAdapterService {
 					return { success: true, message: 'Connection tested successfully' };
 				}
 
+				const data = await credentialsService.decryptForUse(
+					credential,
+					{ kind: 'user', user },
+					boundProjectId,
+				);
+				// Eval-only: aim the test at the thread's stand-in.
+				const target = getCredentialTestTarget?.(credential.type);
 				const credentialsToTest: ICredentialsDecrypted = {
 					id: credential.id,
 					name: credential.name,
 					type: credential.type,
-					data: await credentialsService.decrypt(credential, true),
+					data: target ? { ...data, [target.urlField]: target.baseUrl } : data,
 				};
 
 				const result = await credentialsService.test(user.id, credentialsToTest);
@@ -3459,7 +3509,6 @@ export class InstanceAiAdapterService {
 			},
 
 			async insertRows(dataTableId, rows, options) {
-				assertNotReadOnly();
 				const { projectId, tableName, resolvedId } = await resolveTableMeta(
 					['dataTable:writeRow'],
 					dataTableId,
@@ -3480,7 +3529,6 @@ export class InstanceAiAdapterService {
 			},
 
 			async updateRows(dataTableId, filter, data, options) {
-				assertNotReadOnly();
 				const { projectId, tableName, resolvedId } = await resolveTableMeta(
 					['dataTable:writeRow'],
 					dataTableId,
@@ -3501,7 +3549,6 @@ export class InstanceAiAdapterService {
 			},
 
 			async deleteRows(dataTableId, filter, options) {
-				assertNotReadOnly();
 				const { projectId, tableName, resolvedId } = await resolveTableMeta(
 					['dataTable:writeRow'],
 					dataTableId,
@@ -3712,7 +3759,15 @@ export class InstanceAiAdapterService {
 	private createNodeAdapter(user: User): InstanceAiNodeService {
 		// Use the service-level cache instead of a per-adapter closure.
 		// This avoids each run retaining its own ~31 MB copy of node descriptions.
-		const getNodes = async () => await this.getNodesFromCache();
+		const getAllNodes = async () => await this.getNodesFromCache();
+		// Discovery leaves out nodes whose module is off. Lookups by name keep them and say why.
+		const getNodes = async () => {
+			const nodes = await getAllNodes();
+			const disabled = new Set(getModuleDisabledNodeTypes(Container.get(ModuleRegistry)));
+			return disabled.size > 0 ? nodes.filter((n) => !disabled.has(n.name)) : nodes;
+		};
+		const getUnavailableNotice = (nodeType: string) =>
+			getModuleDisabledNotice(Container.get(ModuleRegistry), nodeType);
 		const getGatewayConfig = async () => await this.getGatewayConfigOrNull();
 		const buildMeta = (config: AiGatewayConfigDto | null, nodeName: string) =>
 			this.buildAiGatewayNodeMeta(config, nodeName);
@@ -3836,7 +3891,7 @@ export class InstanceAiAdapterService {
 
 			async getDescription(nodeType, version, options) {
 				const [nodes, gatewayConfig] = await Promise.all([
-					getNodes(),
+					getAllNodes(),
 					options?.includeGatewayMetadata === false ? Promise.resolve(null) : getGatewayConfig(),
 				]);
 				let desc =
@@ -3857,6 +3912,7 @@ export class InstanceAiAdapterService {
 				}
 
 				const meta = buildMeta(gatewayConfig, desc.name);
+				const unavailable = getUnavailableNotice(desc.name);
 
 				return {
 					name: desc.name,
@@ -3897,6 +3953,7 @@ export class InstanceAiAdapterService {
 					...(desc.polling ? { polling: desc.polling } : {}),
 					...(desc.triggerPanel !== undefined ? { triggerPanel: desc.triggerPanel } : {}),
 					...(meta ? { aiGateway: meta } : {}),
+					...(unavailable ? { unavailable } : {}),
 				} satisfies NodeDescription;
 			},
 
@@ -3915,6 +3972,8 @@ export class InstanceAiAdapterService {
 					});
 
 				const result = await getDefinition(nodeType);
+				const unavailable = getUnavailableNotice(nodeType);
+				if (unavailable && !result.error) return { ...result, unavailable };
 				if (!result.error || nodeType.includes('.')) return result;
 
 				return await getDefinition(`${MCP_REGISTRY_PACKAGE_NAME}.${nodeType}`);
@@ -3927,7 +3986,7 @@ export class InstanceAiAdapterService {
 			},
 
 			getParameterIssues: async (nodeType, typeVersion, parameters) => {
-				const nodes = await getNodes();
+				const nodes = await getAllNodes();
 				const desc = findNodeByVersion(nodes, nodeType, typeVersion);
 				if (!desc) return {};
 
@@ -3986,7 +4045,7 @@ export class InstanceAiAdapterService {
 			},
 
 			getNodeCredentialTypes: async (nodeType, typeVersion, parameters, _existingCredentials) => {
-				const nodes = await getNodes();
+				const nodes = await getAllNodes();
 				const desc = findNodeByVersion(nodes, nodeType, typeVersion);
 				if (!desc) return [];
 
